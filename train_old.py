@@ -1,7 +1,4 @@
 #!/usr/bin/env python
-# ... (other imports)
-
-#!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 
 """
@@ -86,21 +83,29 @@ def get_arguments():
 
 def main():
     args = get_arguments()
+    local_rank = args.local_rank
 
     start_epoch = 0
     cycle_n = 0
 
     if not os.path.exists(args.log_dir):
-        os.makedirs(args.log_dir)
-
-    if args.local_rank == 0:
+        if local_rank == 0:
+            os.makedirs(args.log_dir)
+    if local_rank == 0:
         with open(os.path.join(args.log_dir, 'args.json'), 'w') as opt_file:
             json.dump(vars(args), opt_file)
         print(args)
+    #gpus = [int(i) for i in args.gpu.split(',')]
+    #if not args.gpu == 'None':
+    #    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dist.init_process_group(backend='nccl')
+
+    device = torch.device("cuda", local_rank)
+
+    torch.cuda.set_device(device)
     input_size = list(map(int, args.input_size.split(',')))
-    print("Device",device)
+
     cudnn.enabled = True
     cudnn.benchmark = True
 
@@ -111,7 +116,9 @@ def main():
         convert_weights = False
     model = networks.init_model(args.arch, num_classes=args.num_classes, pretrained=args.imagenet_pretrain, convert_weights=convert_weights)
     for name, param in model.named_parameters():
+        #if name.startswith("backbone.patch_embed"):
         if "patch_embed" in name:
+            print(name)
             param.requires_grad = False
 
     IMAGE_MEAN = model.mean
@@ -125,8 +132,15 @@ def main():
         model.load_state_dict(checkpoint['state_dict'])
         start_epoch = checkpoint['epoch']
     model.to(device)
+    if args.syncbn:
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     schp_model = networks.init_model(args.arch, num_classes=args.num_classes, pretrained=args.imagenet_pretrain, convert_weights=convert_weights)
+    #for name, param in schp_model.named_parameters():
+        #if name.startswith("backbone.patch_embed"):
+     #   if "patch_embed" in name:
+      #      param.requires_grad = False
 
     if os.path.exists(args.schp_restore):
         print('Resuming schp checkpoint from {}'.format(args.schp_restore))
@@ -136,10 +150,16 @@ def main():
         schp_model.load_state_dict(schp_model_state_dict)
 
     schp_model.to(device)
+    if args.syncbn:
+        print('----use syncBN in model!----')
+        schp_model = nn.SyncBatchNorm.convert_sync_batchnorm(schp_model)
+    schp_model = DDP(schp_model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
 
     # Loss Function
     criterion = CriterionAll(lambda_1=args.lambda_s, lambda_2=args.lambda_e, lambda_3=args.lambda_c,
                              num_classes=args.num_classes)
+    #criterion = DataParallelCriterion(criterion)
+    #criterion.to(device)
 
     # Data Loader
     if INPUT_SPACE == 'BGR':
@@ -160,18 +180,20 @@ def main():
         ])
 
     train_dataset = LIPDataSet(args.data_dir, 'train', crop_size=input_size, transform=transform)
-    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+    dist_sampler = data.distributed.DistributedSampler(train_dataset, shuffle=True)
+
+    train_loader = data.DataLoader(train_dataset, batch_size=args.batch_size, sampler=dist_sampler,
                                    num_workers=8, pin_memory=False, drop_last=True)
     print('Total training samples: {}'.format(len(train_dataset)))
 
     # Optimizer Initialization
     if args.optimizer == 'sgd':
         print("using SGD optimizer")
-        optimizer = optim.SGD(model.parameters(), lr=args.learning_rate, momentum=args.momentum,
-                              weight_decay=args.weight_decay)
+        optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate, momentum=args.momentum,
+                          weight_decay=args.weight_decay)
     elif args.optimizer == 'adam':
         print("using Adam optimizer")
-        optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+        optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.learning_rate, weight_decay=args.weight_decay)
 
     # Original warmup_epoch=10, changed to 3 for fix backbone finetune
     lr_scheduler = SGDRScheduler(optimizer, total_epoch=args.epochs,
@@ -185,20 +207,28 @@ def main():
 
     model.train()
     for epoch in range(start_epoch, args.epochs):
+        dist_sampler.set_epoch(epoch)
         lr = lr_scheduler.get_lr()[0]
 
         for i_iter, batch in enumerate(train_loader):
             i_iter += len(train_loader) * epoch
             images, labels, _ = batch
+            #labels = labels.cuda(non_blocking=True)
             labels = labels.to(device)
-            images  = images.to(device)
 
             edges = generate_edge_tensor(labels)
             labels = labels.type(torch.cuda.LongTensor)
             edges = edges.type(torch.cuda.LongTensor)
+#            for name, param in model.named_parameters():
+#                print(name,': ', param.requires_grad)
+
+            #print('fixed', model.state_dict()['module.conv1.weight'][0,0,0,0])
+            #print('update', model.state_dict()['module.decoder.conv4.weight'][0,0,0,0])
+
 
             preds = model(images)
 
+            # Online Self Correction Cycle with Label Refinement
             if cycle_n >= 1:
                 with torch.no_grad():
                     soft_preds = schp_model(images)
@@ -215,27 +245,28 @@ def main():
             loss.backward()
             optimizer.step()
 
-            if i_iter % 100 == 0:
+            if local_rank == 0 and i_iter % 100 == 0:
                 print('iter = {} of {} completed, lr = {}, loss = {}, time = {}'.format(i_iter, total_iters, lr,
-                                                                                         loss.data.cpu().numpy(), (timeit.default_timer() - iter_start) / 100))
+                                                                             loss.data.cpu().numpy(), (timeit.default_timer()-iter_start)/100))
                 iter_start = timeit.default_timer()
-
         lr_scheduler.step()
-        if (epoch + 1) % (args.eval_epochs) == 0:
+        if local_rank == 0 and (epoch + 1) % (args.eval_epochs) == 0:
             schp.save_schp_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
             }, False, args.log_dir, filename='checkpoint_{}.pth.tar'.format(epoch + 1))
 
+        # Self Correction Cycle with Model Aggregation
         if (epoch + 1) >= args.schp_start and (epoch + 1 - args.schp_start) % args.cycle_epochs == 0:
             print('Self-correction cycle number {}'.format(cycle_n))
             schp.moving_average(schp_model, model, 1.0 / (cycle_n + 1))
             cycle_n += 1
             schp.bn_re_estimate(train_loader, schp_model)
-            schp.save_schp_checkpoint({
-                'state_dict': schp_model.state_dict(),
-                'cycle_n': cycle_n,
-            }, False, args.log_dir, filename='schp_{}_checkpoint.pth.tar'.format(cycle_n))
+            if local_rank == 0:
+                schp.save_schp_checkpoint({
+                    'state_dict': schp_model.state_dict(),
+                    'cycle_n': cycle_n,
+                }, False, args.log_dir, filename='schp_{}_checkpoint.pth.tar'.format(cycle_n))
 
         torch.cuda.empty_cache()
         end = timeit.default_timer()
@@ -244,6 +275,7 @@ def main():
 
     end = timeit.default_timer()
     print('Training Finished in {} seconds'.format(end - start))
+
 
 if __name__ == '__main__':
     main()

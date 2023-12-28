@@ -62,7 +62,8 @@ class LIPDataSet(data.Dataset):
 
         im_path = os.path.join(self.root, self.dataset + '_images', train_item + '.jpg')
         parsing_anno_path = os.path.join(self.root, self.dataset + '_segmentations', train_item + '.png')
-
+        #print(im_path)
+        #print(parsing_anno_path)
         im = cv2.imread(im_path, cv2.IMREAD_COLOR)
         h, w, _ = im.shape
         parsing_anno = np.zeros((h, w), dtype=np.long)

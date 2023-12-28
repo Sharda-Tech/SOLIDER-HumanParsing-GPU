@@ -3,3 +3,6 @@
 data/
 log/
 pretrain_model/
+logs/*
+new/*
+pretrain/*
